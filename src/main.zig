@@ -1,71 +1,72 @@
 const std = @import("std");
 const Io = std.Io;
+const linux = std.os.linux;
+const fs = std.fs;
+const StringHashMap = std.StringHashMap;
+const BufSet = std.BufSet;
 
 const splatmount = @import("splatmount");
 
+//mount -o bind <source> <target>
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
     // This is appropriate for anything that lives as long as the process.
     const arena: std.mem.Allocator = init.arena.allocator();
 
     // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    std.debug.assert(args.len == 3);
+
+    const source = args[1];
+    const target = args[2];
+    std.log.info("source: {s}", .{source});
+    std.log.info("target: {s}\n", .{target});
+
+    // Ls the source directory
+    var sourceSet = try getSubdirs(source, init.io, arena);
+    var targetSet = try getSubdirs(target, init.io, arena);
+    defer sourceSet.deinit();
+    defer targetSet.deinit();
+
+    std.log.info("Directories in source", .{});
+    var iter = sourceSet.iterator();
+    var i: u8 = 1;
+    while (iter.next()) |entry| : (i += 1) {
+        std.log.info("{d}) {s}", .{ i, entry.* });
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    std.log.info("Directories in target", .{});
+    var iterT = targetSet.iterator();
+    i = 1;
+    while (iterT.next()) |entry| : (i += 1) {
+        std.log.info("{d}) {s}", .{ i, entry.* });
+    }
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    std.log.info("Directories to mount", .{});
+    var iterD = sourceSet.iterator();
+    i = 1;
+    while (iterD.next()) |entry| {
+        if (!targetSet.contains(entry.*) and entry.*[0] != '.') {
+            std.log.info("{d}) {s}", .{ i, entry.* });
+            i += 1;
+        }
+    }
 
-    try splatmount.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    // Remove all directories present in both sets
+    // For each, call linux.mount(...)
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+pub fn getSubdirs(name: [:0]const u8, io: Io, alloc: std.mem.Allocator) !std.BufSet {
+    var dir = Io.Dir.cwd().openDir(io, name, .{ .iterate = true }) catch |err| return err;
+    defer dir.close(io);
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
+    var set: BufSet = .init(alloc);
 
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            try set.insert(entry.name);
+        }
+    }
 
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+    return set;
 }
