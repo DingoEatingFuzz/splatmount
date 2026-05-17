@@ -8,20 +8,45 @@ pub fn main(init: std.process.Init) !void {
 
     // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
-        std.log.info("splatmount [source] [target] [fstype]\n", .{});
-        std.log.info("Splatmount runs mount -o bind on every directory in the [source] directory, mounting them in [target].", .{});
-        std.log.info("source: A filesystem path. Directories in this path will be mounted in target.", .{});
-        std.log.info("target: A filesystem path. Directories in source will be mounted here.", .{});
-        std.log.info("fstype: a filesystem type. Try `cat /proc/filesystems` to see available options.", .{});
-        std.process.exit(0);
+    switch (args.len) {
+        2 => {
+            if (std.mem.eql(u8, args[1], "--help")) {
+                exitWithHelp();
+            } else {
+                exitWithArgsError(args.len);
+            }
+        },
+        4 => {
+            // Refactor splatmount to handle all its own errors
+            try splatmount(args, arena, init);
+        },
+        else => {
+            exitWithArgsError(args.len);
+        },
     }
+}
 
-    if (args.len != 4) {
-        std.log.info("Expected 4 arguments, received {d}. Try splatmount --help", .{args.len});
-        std.process.exit(1);
-    }
+fn exitWithHelp() void {
+    const help =
+        \\splatmount [source] [target] [fstype]
+        \\
+        \\Splatmount runs `mount -p bind` on every directory in the [source] directory, mounting them in [target].
+        \\
+        \\source: A filesystem path. Directories in this path will be mounted in target.
+        \\target: A filesystem path. Directories in source will be mounted here.
+        \\fstype: A filesystem type.
+        \\        Try `cat /proc/filesystems` to see available options.
+    ;
+    std.log.info(help, .{});
+    std.process.exit(0);
+}
 
+fn exitWithArgsError(len: usize) void {
+    std.log.info("Expected 4 arguments, received {d}. Try splatmount --help", .{len});
+    std.process.exit(1);
+}
+
+fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, init: std.process.Init) !void {
     const source = args[1];
     const target = args[2];
     const fstype = args[3]; // btrfs
