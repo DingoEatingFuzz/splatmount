@@ -1,11 +1,5 @@
 const std = @import("std");
-const Io = std.Io;
 const linux = std.os.linux;
-const fs = std.fs;
-const StringHashMap = std.StringHashMap;
-const BufSet = std.BufSet;
-
-const splatmount = @import("splatmount");
 
 //mount -o bind <source> <target>
 pub fn main(init: std.process.Init) !void {
@@ -14,14 +8,24 @@ pub fn main(init: std.process.Init) !void {
 
     // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
-    std.debug.assert(args.len == 3);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
+        std.log.info("splatmount [source] [target] [fstype]\n", .{});
+        std.log.info("Splatmount runs mount -o bind on every directory in the [source] directory, mounting them in [target].", .{});
+        std.log.info("source: A filesystem path. Directories in this path will be mounted in target.", .{});
+        std.log.info("target: A filesystem path. Directories in source will be mounted here.", .{});
+        std.log.info("fstype: a filesystem type. Try `cat /proc/filesystems` to see available options.", .{});
+        std.process.exit(0);
+    }
+
+    if (args.len != 4) {
+        std.log.info("Expected 4 arguments, received {d}. Try splatmount --help", .{args.len});
+        std.process.exit(1);
+    }
 
     const source = args[1];
     const target = args[2];
-    std.log.info("source: {s}", .{source});
-    std.log.info("target: {s}\n", .{target});
+    const fstype = args[3]; // btrfs
 
-    // Ls the source directory
     var sourceSet = try getSubdirs(source, init.io, arena);
     var targetSet = try getSubdirs(target, init.io, arena);
     defer sourceSet.deinit();
@@ -41,25 +45,42 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("{d}) {s}", .{ i, entry.* });
     }
 
-    std.log.info("Directories to mount", .{});
-    var iterD = sourceSet.iterator();
-    i = 1;
-    while (iterD.next()) |entry| {
-        if (!targetSet.contains(entry.*) and entry.*[0] != '.') {
-            std.log.info("{d}) {s}", .{ i, entry.* });
-            i += 1;
-        }
-    }
+    var mountList = try getMountList(sourceSet, targetSet, arena);
+    defer mountList.deinit(arena);
 
-    // Remove all directories present in both sets
-    // For each, call linux.mount(...)
+    // Handle the error
+    try mountDirs(source, target, fstype, mountList, arena);
 }
 
-pub fn getSubdirs(name: [:0]const u8, io: Io, alloc: std.mem.Allocator) !std.BufSet {
-    var dir = Io.Dir.cwd().openDir(io, name, .{ .iterate = true }) catch |err| return err;
+pub fn getMountList(source: std.BufSet, target: std.BufSet, alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
+    var list: std.ArrayList([]const u8) = .empty;
+    var iter = source.iterator();
+    while (iter.next()) |entry| {
+        if (entry.*[0] != '.' and !target.contains(entry.*)) {
+            try list.append(alloc, entry.*);
+        }
+    }
+    return list;
+}
+
+pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype: [:0]const u8, dirs: std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    for (dirs.items, 1..) |item, idx| {
+        const fullsource = try std.mem.concat(allocator, u8, &[_][]const u8{ sourcePrefix, "/", item });
+        const fulltarget = try std.mem.concat(allocator, u8, &[_][]const u8{ targetPrefix, "/", item });
+
+        std.log.info("{d}) {s} [[{s} -> {s}]]", .{ idx, item, fullsource, fulltarget });
+        // This is jank as hell and needs to be tested
+        // Returns an error code, make sure to handle it
+        // If any mount fails, call umount on any successful ones (i.e., treat all mounts as a single transaction)
+        _ = linux.mount(try allocator.dupeSentinel(u8, fullsource, 0), try allocator.dupeSentinel(u8, fulltarget, 0), fstype, linux.MS.BIND, 0);
+    }
+}
+
+pub fn getSubdirs(name: [:0]const u8, io: std.Io, alloc: std.mem.Allocator) !std.BufSet {
+    var dir = std.Io.Dir.cwd().openDir(io, name, .{ .iterate = true }) catch |err| return err;
     defer dir.close(io);
 
-    var set: BufSet = .init(alloc);
+    var set: std.BufSet = .init(alloc);
 
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
@@ -69,4 +90,51 @@ pub fn getSubdirs(name: [:0]const u8, io: Io, alloc: std.mem.Allocator) !std.Buf
     }
 
     return set;
+}
+
+const expect = std.testing.expect;
+const tallocator = std.testing.allocator;
+
+test "mount list contains source entries not found in target" {
+    var setA = std.BufSet.init(tallocator);
+    defer setA.deinit();
+    try setA.insert("abc");
+    try setA.insert("def");
+    try setA.insert("ghi");
+
+    var setB = std.BufSet.init(tallocator);
+    defer setB.deinit();
+    try setB.insert("xyz");
+    try setB.insert("abc");
+    try setB.insert("uvw");
+
+    var list = try getMountList(setA, setB, tallocator);
+    defer list.deinit(tallocator);
+
+    try expect(list.items.len == 2);
+    try expect(std.mem.eql(u8, list.items[0], "def"));
+    try expect(std.mem.eql(u8, list.items[1], "ghi"));
+}
+
+test "mount list omits entries starting with '.'" {
+    var setA = std.BufSet.init(tallocator);
+    defer setA.deinit();
+    try setA.insert("abc");
+    try setA.insert("def");
+    try setA.insert("ghi");
+    try setA.insert(".its");
+    try setA.insert(".");
+    try setA.insert("..");
+    try setA.insert(".a secret");
+
+    var setB = std.BufSet.init(tallocator);
+    defer setB.deinit();
+
+    var list = try getMountList(setA, setB, tallocator);
+    defer list.deinit(tallocator);
+
+    try expect(list.items.len == 3);
+    try expect(std.mem.eql(u8, list.items[0], "abc"));
+    try expect(std.mem.eql(u8, list.items[1], "def"));
+    try expect(std.mem.eql(u8, list.items[2], "ghi"));
 }
