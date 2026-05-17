@@ -17,8 +17,7 @@ pub fn main(init: std.process.Init) !void {
             }
         },
         4 => {
-            // Refactor splatmount to handle all its own errors
-            try splatmount(args, arena, init);
+            splatmount(args, arena, init);
         },
         else => {
             exitWithArgsError(args.len);
@@ -46,13 +45,20 @@ fn exitWithArgsError(len: usize) void {
     std.process.exit(1);
 }
 
-fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, init: std.process.Init) !void {
+fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, init: std.process.Init) void {
     const source = args[1];
     const target = args[2];
     const fstype = args[3]; // btrfs
 
-    var sourceSet = try getSubdirs(source, init.io, arena);
-    var targetSet = try getSubdirs(target, init.io, arena);
+    var sourceSet = getSubdirs(source, init.io, arena) catch |err| {
+        std.log.err("Failed to get source directories: {}", .{err});
+        std.process.exit(1);
+    };
+    var targetSet = getSubdirs(target, init.io, arena) catch |err| {
+        std.log.err("Failed to get target directories: {}", .{err});
+        std.process.exit(1);
+    };
+
     defer sourceSet.deinit();
     defer targetSet.deinit();
 
@@ -70,17 +76,25 @@ fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, init: std.pr
         std.log.info("{d}) {s}", .{ i, entry.* });
     }
 
-    var mountList = try getMountList(sourceSet, targetSet, arena);
+    var mountList = getMountList(sourceSet, targetSet, arena) catch |err| {
+        std.log.err("Out of memory when determining mount list: {}", .{err});
+        std.process.exit(1);
+    };
+
     defer mountList.deinit(arena);
 
     // Handle the error
-    try mountDirs(source, target, fstype, mountList, arena);
+    mountDirs(source, target, fstype, mountList, arena) catch |err| {
+        std.log.err("Failed to mount all directories. No directories mounted.\n\n{}", .{err});
+        std.process.exit(1);
+    };
 }
 
 pub fn getMountList(source: std.BufSet, target: std.BufSet, alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
     var list: std.ArrayList([]const u8) = .empty;
     var iter = source.iterator();
     while (iter.next()) |entry| {
+        // Include entries in target that are empty
         if (entry.*[0] != '.' and !target.contains(entry.*)) {
             try list.append(alloc, entry.*);
         }
@@ -93,7 +107,10 @@ pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype:
         const fullsource = try std.mem.concat(allocator, u8, &[_][]const u8{ sourcePrefix, "/", item });
         const fulltarget = try std.mem.concat(allocator, u8, &[_][]const u8{ targetPrefix, "/", item });
 
+        // If the target dir doesn't exist, make it (needed to mount on)
+
         std.log.info("{d}) {s} [[{s} -> {s}]]", .{ idx, item, fullsource, fulltarget });
+        // Make directories in target if necessary
         // This is jank as hell and needs to be tested
         // Returns an error code, make sure to handle it
         // If any mount fails, call umount on any successful ones (i.e., treat all mounts as a single transaction)
@@ -102,7 +119,7 @@ pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype:
 }
 
 pub fn getSubdirs(name: [:0]const u8, io: std.Io, alloc: std.mem.Allocator) !std.BufSet {
-    var dir = std.Io.Dir.cwd().openDir(io, name, .{ .iterate = true }) catch |err| return err;
+    var dir = try std.Io.Dir.cwd().openDir(io, name, .{ .iterate = true });
     defer dir.close(io);
 
     var set: std.BufSet = .init(alloc);
@@ -110,7 +127,17 @@ pub fn getSubdirs(name: [:0]const u8, io: std.Io, alloc: std.mem.Allocator) !std
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind == .directory) {
-            try set.insert(entry.name);
+            // Exclude empty subdirs
+            const subdirName = try std.fs.path.resolve(alloc, &[_][]const u8{ name, entry.name });
+            defer alloc.free(subdirName);
+
+            var subdir = try std.Io.Dir.cwd().openDir(io, subdirName, .{ .iterate = true });
+            defer subdir.close(io);
+            var subiter = subdir.iterate();
+            // If next returns an entry, the directory is not empty
+            if (try subiter.next(io)) |_| {
+                try set.insert(entry.name);
+            }
         }
     }
 
