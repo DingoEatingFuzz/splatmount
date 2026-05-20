@@ -2,6 +2,7 @@ const std = @import("std");
 const splatmount = @import("main.zig");
 
 const expect = std.testing.expect;
+const expectError = std.testing.expectError;
 const allocator = std.testing.allocator;
 const io = std.testing.io;
 
@@ -87,8 +88,6 @@ fn teardown(mounts: std.ArrayList([]const u8)) void {
     for (mounts.items) |mount| {
         if (allocator.dupeSentinel(u8, mount, 0)) |ms| {
             defer allocator.free(ms);
-            // TODO: try closing directories in setup
-            // _ = std.os.linux.umount2(ms, std.os.linux.MNT.FORCE);
             const rc = std.os.linux.umount(ms);
             switch (std.os.linux.errno(rc)) {
                 .SUCCESS => {},
@@ -100,28 +99,29 @@ fn teardown(mounts: std.ArrayList([]const u8)) void {
             std.log.err("Failed to teardown {}", .{err});
         }
     }
+
     // Remove the test dir structure
     std.Io.Dir.cwd().deleteTree(io, TEST_DIR) catch |err| {
         std.log.err("Could not delete tree {}", .{err});
     };
 }
 
-// test "getSubdirs gets all non-empty non-hidden directories" {
-//     std.testing.log_level = .debug;
-//
-//     try setup();
-//     defer teardown(.empty);
-//
-//     var src = try splatmount.getSubdirs(TEST_DIR ++ "/src", io, allocator);
-//     defer src.deinit();
-//
-//     try expect(src.count() == 3);
-//     try expect(src.contains("foo"));
-//     try expect(src.contains("bar"));
-//     try expect(src.contains("new"));
-//     try expect(!src.contains("baz"));
-//     try expect(!src.contains(".hidden"));
-// }
+test "getSubdirs gets all non-empty non-hidden directories" {
+    std.testing.log_level = .debug;
+
+    try setup();
+    defer teardown(.empty);
+
+    var src = try splatmount.getSubdirs(TEST_DIR ++ "/src", io, allocator);
+    defer src.deinit();
+
+    try expect(src.count() == 3);
+    try expect(src.contains("foo"));
+    try expect(src.contains("bar"));
+    try expect(src.contains("new"));
+    try expect(!src.contains("baz"));
+    try expect(!src.contains(".hidden"));
+}
 
 test "splatmount mounts all directories" {
     std.testing.log_level = .debug;
@@ -129,8 +129,27 @@ test "splatmount mounts all directories" {
 
     var mounts = splatmount.splatmount(&[_][:0]const u8{ "__", TEST_DIR ++ "/src", TEST_DIR ++ "/target", "ext4" }, allocator, io);
     defer mounts.deinit(allocator);
-    defer {
-        for (mounts.items) |mount| allocator.free(mount);
-    }
-    teardown(mounts);
+    defer for (mounts.items) |mount| allocator.free(mount);
+    defer teardown(mounts);
+
+    const dir = std.Io.Dir.cwd();
+
+    // Foo has xyz
+    try dir.access(io, TEST_DIR ++ "/target/foo/x", .{ .read = true });
+    try dir.access(io, TEST_DIR ++ "/target/foo/y", .{ .read = true });
+    try dir.access(io, TEST_DIR ++ "/target/foo/z", .{ .read = true });
+
+    // Bar has def
+    try dir.access(io, TEST_DIR ++ "/target/bar/d", .{ .read = true });
+    try dir.access(io, TEST_DIR ++ "/target/bar/e", .{ .read = true });
+    try dir.access(io, TEST_DIR ++ "/target/bar/f", .{ .read = true });
+
+    // New has hgi
+    try dir.access(io, TEST_DIR ++ "/target/new/h", .{ .read = true });
+    try dir.access(io, TEST_DIR ++ "/target/new/g", .{ .read = true });
+    try dir.access(io, TEST_DIR ++ "/target/new/i", .{ .read = true });
+
+    // Baz and .hidden don't exist
+    try expectError(error.FileNotFound, dir.access(io, TEST_DIR ++ "/target/baz", .{ .read = true }));
+    try expectError(error.FileNotFound, dir.access(io, TEST_DIR ++ "/target/.hidden", .{ .read = true }));
 }
