@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
             }
         },
         4 => {
-            splatmount(args, arena, init);
+            _ = splatmount(args, arena, init.io);
         },
         else => {
             exitWithArgsError(args.len);
@@ -45,16 +45,17 @@ fn exitWithArgsError(len: usize) void {
     std.process.exit(1);
 }
 
-fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, init: std.process.Init) void {
+// Return the set of new mounts (target paths)
+pub fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, io: std.Io) std.ArrayList([]const u8) {
     const source = args[1];
     const target = args[2];
     const fstype = args[3]; // btrfs
 
-    var sourceSet = getSubdirs(source, init.io, arena) catch |err| {
+    var sourceSet = getSubdirs(source, io, arena) catch |err| {
         std.log.err("Failed to get source directories: {}", .{err});
         std.process.exit(1);
     };
-    var targetSet = getSubdirs(target, init.io, arena) catch |err| {
+    var targetSet = getSubdirs(target, io, arena) catch |err| {
         std.log.err("Failed to get target directories: {}", .{err});
         std.process.exit(1);
     };
@@ -84,8 +85,12 @@ fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, init: std.pr
     defer mountList.deinit(arena);
 
     // Handle the error
-    mountDirs(source, target, fstype, mountList, arena) catch |err| {
-        std.log.err("Failed to mount all directories. No directories mounted.\n\n{}", .{err});
+    return mountDirs(source, target, fstype, mountList, io, arena) catch |err| {
+        switch (err) {
+            error.InsufficientPermissions => std.log.err("Insufficient permissions. Try running with sudo", .{}),
+            error.NoSuchDirectory => std.log.err("Could not find a directory", .{}),
+            else => std.log.err("Failed to mount all directories. No directories mounted.", .{}),
+        }
         std.process.exit(1);
     };
 }
@@ -102,20 +107,128 @@ pub fn getMountList(source: std.BufSet, target: std.BufSet, alloc: std.mem.Alloc
     return list;
 }
 
-pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype: [:0]const u8, dirs: std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
-    for (dirs.items, 1..) |item, idx| {
+pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype: [:0]const u8, dirs: std.ArrayList([]const u8), io: std.Io, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+    var newdirs: std.ArrayList([:0]const u8) = .empty;
+    var newmounts: std.ArrayList([:0]const u8) = .empty;
+    var abort = false;
+    var ret: anyerror = undefined;
+
+    defer newdirs.deinit(allocator);
+    defer newmounts.deinit(allocator);
+
+    // Before making any directories or mounting anything, ensure we can build all the strings
+    var dirpairs: std.ArrayList([2][:0]const u8) = .empty;
+    defer dirpairs.deinit(allocator);
+
+    for (dirs.items) |item| {
         const fullsource = try std.mem.concat(allocator, u8, &[_][]const u8{ sourcePrefix, "/", item });
         const fulltarget = try std.mem.concat(allocator, u8, &[_][]const u8{ targetPrefix, "/", item });
+        defer allocator.free(fullsource);
+        defer allocator.free(fulltarget);
+
+        const mountFrom = try allocator.dupeSentinel(u8, fullsource, 0);
+        const mountTo = try allocator.dupeSentinel(u8, fulltarget, 0);
+
+        try dirpairs.append(allocator, .{ mountFrom, mountTo });
+    }
+    defer {
+        for (dirpairs.items) |pair| {
+            allocator.free(pair[0]);
+            allocator.free(pair[1]);
+        }
+    }
+
+    std.log.info("Mounting dirs...", .{});
+    for (dirpairs.items, 1..) |pair, idx| {
+        const fullsource = pair[0];
+        const fulltarget = pair[1];
 
         // If the target dir doesn't exist, make it (needed to mount on)
+        std.log.info("Attempting to make a dir: {s} :: {s}", .{ fullsource, fulltarget });
+        const maybeDir = std.Io.Dir.cwd().createDir(io, fulltarget, std.Io.File.Permissions.default_dir);
+        if (maybeDir) {
+            newdirs.append(allocator, fulltarget) catch |nerr| {
+                std.log.err("Could not create new dir {s}", .{fulltarget});
+                ret = nerr;
+                abort = true;
+                std.Io.Dir.cwd().deleteDir(io, fulltarget) catch |cleanErr| {
+                    std.log.err("Could not clean up new dir {s}", .{fulltarget});
+                    ret = cleanErr;
+                };
+                break;
+            };
+        } else |err| {
+            switch (err) {
+                error.PathAlreadyExists => {},
+                else => {
+                    abort = true;
+                    std.log.err("Surprise error when attempting to create a dir", .{});
+                    ret = err;
+                },
+            }
+        }
 
-        std.log.info("{d}) {s} [[{s} -> {s}]]", .{ idx, item, fullsource, fulltarget });
-        // Make directories in target if necessary
-        // This is jank as hell and needs to be tested
-        // Returns an error code, make sure to handle it
-        // If any mount fails, call umount on any successful ones (i.e., treat all mounts as a single transaction)
-        _ = linux.mount(try allocator.dupeSentinel(u8, fullsource, 0), try allocator.dupeSentinel(u8, fulltarget, 0), fstype, linux.MS.BIND, 0);
+        std.log.info("{d}) [[{s} -> {s}]]", .{ idx, fullsource, fulltarget });
+
+        const rc = linux.mount(fullsource, fulltarget, fstype, linux.MS.BIND, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                newmounts.append(allocator, fulltarget) catch |err| {
+                    _ = linux.umount(fulltarget);
+                    abort = true;
+                    std.log.err("Could not allocate newmount", .{});
+                    ret = err;
+                    break;
+                };
+                continue;
+            },
+            else => |err| {
+                abort = true;
+                std.log.err("Kernel error from mount syscall", .{});
+                switch (err) {
+                    .PERM => ret = error.InsufficientPermissions,
+                    .NOENT => ret = error.NoSuchDirectory,
+                    else => |ierr| ret = std.posix.unexpectedErrno(ierr),
+                }
+                break;
+            },
+        }
     }
+
+    // mountDirs is transactional: if anything fails, undo everything that succeeded.
+    if (abort) {
+        for (newmounts.items) |mnt| {
+            const rc = linux.umount(mnt);
+            switch (linux.errno(rc)) {
+                .SUCCESS => continue,
+                else => {
+                    std.log.err("Kernel error from umount syscall {s}", .{mnt});
+                    ret = error.CouldNotCleanUpMounts;
+                },
+            }
+        }
+        for (newdirs.items) |dir| {
+            std.Io.Dir.cwd().deleteDir(io, dir) catch {
+                std.log.err("Could not delete dir {s}", .{dir});
+                if (ret != error.CouldNotCleanUpMounts) {
+                    ret = error.CouldNotCleanUpDirectories;
+                }
+            };
+        }
+        return ret;
+    }
+
+    std.log.info("Got to the point where a mounted list is being built", .{});
+    var mounted: std.ArrayList([]const u8) = .empty;
+    for (dirpairs.items) |item| {
+        const copy = std.mem.Allocator.dupe(allocator, u8, item[1]) catch {
+            return error.SuccessfullyMountedFailedToReport;
+        };
+        mounted.append(allocator, copy) catch {
+            return error.SuccessfullyMountedFailedToReport;
+        };
+    }
+    return mounted;
 }
 
 pub fn getSubdirs(name: [:0]const u8, io: std.Io, alloc: std.mem.Allocator) !std.BufSet {
@@ -127,6 +240,9 @@ pub fn getSubdirs(name: [:0]const u8, io: std.Io, alloc: std.mem.Allocator) !std
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind == .directory) {
+            // Exclude hidden directories
+            if (entry.name[0] == '.') continue;
+
             // Exclude empty subdirs
             const subdirName = try std.fs.path.resolve(alloc, &[_][]const u8{ name, entry.name });
             defer alloc.free(subdirName);
@@ -134,6 +250,7 @@ pub fn getSubdirs(name: [:0]const u8, io: std.Io, alloc: std.mem.Allocator) !std
             var subdir = try std.Io.Dir.cwd().openDir(io, subdirName, .{ .iterate = true });
             defer subdir.close(io);
             var subiter = subdir.iterate();
+
             // If next returns an entry, the directory is not empty
             if (try subiter.next(io)) |_| {
                 try set.insert(entry.name);
