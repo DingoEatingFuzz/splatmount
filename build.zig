@@ -83,6 +83,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Build targets for other platforms
+    // const linux_arm
+    // const linux_x86
+    // const macos_arm
+    // const macos_x86
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden

@@ -138,13 +138,18 @@ pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype:
         }
     }
 
-    std.log.info("Mounting dirs...", .{});
+    std.log.info("Required mounts:", .{});
+    for (dirpairs.items, 1..) |pair, idx| {
+        std.log.info("{d}) {s} -> {s}", .{ idx, pair[0], pair[1] });
+    }
+
+    std.log.info("Making mounts", .{});
     for (dirpairs.items, 1..) |pair, idx| {
         const fullsource = pair[0];
         const fulltarget = pair[1];
 
         // If the target dir doesn't exist, make it (needed to mount on)
-        std.log.info("Attempting to make a dir: {s} :: {s}", .{ fullsource, fulltarget });
+        std.log.info("{d}) Making missing dir: {s}", .{ idx, fulltarget });
         const maybeDir = std.Io.Dir.cwd().createDir(io, fulltarget, std.Io.File.Permissions.default_dir);
         if (maybeDir) {
             newdirs.append(allocator, fulltarget) catch |nerr| {
@@ -168,7 +173,7 @@ pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype:
             }
         }
 
-        std.log.info("{d}) [[{s} -> {s}]]", .{ idx, fullsource, fulltarget });
+        std.log.info("{d}) Mounting: {s} -> {s}", .{ idx, fullsource, fulltarget });
 
         const rc = linux.mount(fullsource, fulltarget, fstype, linux.MS.BIND, 0);
         switch (linux.errno(rc)) {
@@ -218,7 +223,6 @@ pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype:
         return ret;
     }
 
-    std.log.info("Got to the point where a mounted list is being built", .{});
     var mounted: std.ArrayList([]const u8) = .empty;
     for (dirpairs.items) |item| {
         const copy = std.mem.Allocator.dupe(allocator, u8, item[1]) catch {
