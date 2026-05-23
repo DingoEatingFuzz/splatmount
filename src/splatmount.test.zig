@@ -127,7 +127,7 @@ test "splatmount mounts all directories" {
     std.testing.log_level = .debug;
     try setup();
 
-    var mounts = splatmount.splatmount(&[_][:0]const u8{ "__", TEST_DIR ++ "/src", TEST_DIR ++ "/target", "ext4" }, allocator, io);
+    var mounts = splatmount.splatmount(&[_][:0]const u8{ "__", TEST_DIR ++ "/src", TEST_DIR ++ "/target", "ext4" }, true, allocator, io);
     defer mounts.deinit(allocator);
     defer for (mounts.items) |mount| allocator.free(mount);
     defer teardown(mounts);
@@ -148,6 +148,27 @@ test "splatmount mounts all directories" {
     try dir.access(io, TEST_DIR ++ "/target/new/h", .{ .read = true });
     try dir.access(io, TEST_DIR ++ "/target/new/g", .{ .read = true });
     try dir.access(io, TEST_DIR ++ "/target/new/i", .{ .read = true });
+
+    // Baz and .hidden don't exist
+    try expectError(error.FileNotFound, dir.access(io, TEST_DIR ++ "/target/baz", .{ .read = true }));
+    try expectError(error.FileNotFound, dir.access(io, TEST_DIR ++ "/target/.hidden", .{ .read = true }));
+}
+
+test "when makeMounts is false, nothing is mounted" {
+    std.testing.log_level = .debug;
+    try setup();
+
+    var mounts = splatmount.splatmount(&[_][:0]const u8{ "__", TEST_DIR ++ "/src", TEST_DIR ++ "/target", "ext4" }, false, allocator, io);
+    defer mounts.deinit(allocator);
+    defer for (mounts.items) |mount| allocator.free(mount);
+    defer teardown(mounts);
+
+    const dir = std.Io.Dir.cwd();
+
+    // Foo, bar, and new were never mounted
+    try dir.access(io, TEST_DIR ++ "/target/foo/x", .{ .read = true });
+    try expectError(error.FileNotFound, dir.access(io, TEST_DIR ++ "/target/bar/d", .{ .read = true }));
+    try expectError(error.FileNotFound, dir.access(io, TEST_DIR ++ "/target/new/h", .{ .read = true }));
 
     // Baz and .hidden don't exist
     try expectError(error.FileNotFound, dir.access(io, TEST_DIR ++ "/target/baz", .{ .read = true }));

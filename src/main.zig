@@ -8,26 +8,36 @@ pub fn main(init: std.process.Init) !void {
 
     // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
+    // TODO: iterate over args collecting flags like -d or --help
+    // This already bit me once.
     switch (args.len) {
         2 => {
             if (std.mem.eql(u8, args[1], "--help")) {
                 exitWithHelp();
             } else {
-                exitWithArgsError(args.len);
+                exitWithArgsError();
             }
         },
         4 => {
-            _ = splatmount(args, arena, init.io);
+            _ = splatmount(args, true, arena, init.io);
+        },
+        5 => {
+            if (std.mem.eql(u8, args[1], "-d") or std.mem.eql(u8, args[1], "--dry-run")) {
+                // This is flaky. Make a struct or something instead of slicing
+                _ = splatmount(args[1..], false, arena, init.io);
+            } else {
+                exitWithArgsError();
+            }
         },
         else => {
-            exitWithArgsError(args.len);
+            exitWithArgsError();
         },
     }
 }
 
 fn exitWithHelp() void {
     const help =
-        \\splatmount [source] [target] [fstype]
+        \\splatmount (-d) [source] [target] [fstype]
         \\
         \\Splatmount runs `mount -p bind` on every directory in the [source] directory, mounting them in [target].
         \\
@@ -35,21 +45,26 @@ fn exitWithHelp() void {
         \\target: A filesystem path. Directories in source will be mounted here.
         \\fstype: A filesystem type.
         \\        Try `cat /proc/filesystems` to see available options.
+        \\
+        \\Flags:
+        \\
+        \\  -d, --dry-run: Dry-run
     ;
     std.log.info(help, .{});
     std.process.exit(0);
 }
 
-fn exitWithArgsError(len: usize) void {
-    std.log.info("Expected 4 arguments, received {d}. Try splatmount --help", .{len});
+fn exitWithArgsError() void {
+    std.log.info("Unexpected number of arguments. Try splatmount --help", .{});
     std.process.exit(1);
 }
 
 // Return the set of new mounts (target paths)
-pub fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, io: std.Io) std.ArrayList([]const u8) {
+pub fn splatmount(args: []const [:0]const u8, makeMounts: bool, arena: std.mem.Allocator, io: std.Io) std.ArrayList([]const u8) {
     const source = args[1];
     const target = args[2];
     const fstype = args[3]; // btrfs
+    std.log.info("Args: {s}, {s}, {s}", .{ source, target, fstype });
 
     var sourceSet = getSubdirs(source, io, arena) catch |err| {
         std.log.err("Failed to get source directories: {}", .{err});
@@ -84,8 +99,7 @@ pub fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, io: std.
 
     defer mountList.deinit(arena);
 
-    // Handle the error
-    return mountDirs(source, target, fstype, mountList, io, arena) catch |err| {
+    const mounted = mountDirs(source, target, fstype, mountList, makeMounts, io, arena) catch |err| {
         switch (err) {
             error.InsufficientPermissions => std.log.err("Insufficient permissions. Try running with sudo", .{}),
             error.NoSuchDirectory => std.log.err("Could not find a directory", .{}),
@@ -93,6 +107,10 @@ pub fn splatmount(args: []const [:0]const u8, arena: std.mem.Allocator, io: std.
         }
         std.process.exit(1);
     };
+
+    if (!makeMounts) std.log.info("This was a dry run! Nothing was mounted!!", .{});
+
+    return mounted;
 }
 
 pub fn getMountList(source: std.BufSet, target: std.BufSet, alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
@@ -107,7 +125,7 @@ pub fn getMountList(source: std.BufSet, target: std.BufSet, alloc: std.mem.Alloc
     return list;
 }
 
-pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype: [:0]const u8, dirs: std.ArrayList([]const u8), io: std.Io, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype: [:0]const u8, dirs: std.ArrayList([]const u8), makeMounts: bool, io: std.Io, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
     var newdirs: std.ArrayList([:0]const u8) = .empty;
     var newmounts: std.ArrayList([:0]const u8) = .empty;
     var abort = false;
@@ -141,6 +159,11 @@ pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype:
     std.log.info("Required mounts:", .{});
     for (dirpairs.items, 1..) |pair, idx| {
         std.log.info("{d}) {s} -> {s}", .{ idx, pair[0], pair[1] });
+    }
+
+    if (!makeMounts) {
+        const mounted: std.ArrayList([]const u8) = .empty;
+        return mounted;
     }
 
     std.log.info("Making mounts", .{});
@@ -235,8 +258,10 @@ pub fn mountDirs(sourcePrefix: [:0]const u8, targetPrefix: [:0]const u8, fstype:
     return mounted;
 }
 
+// TODO: Include names of files that aren't found
 pub fn getSubdirs(name: [:0]const u8, io: std.Io, alloc: std.mem.Allocator) !std.BufSet {
-    var dir = try std.Io.Dir.cwd().openDir(io, name, .{ .iterate = true });
+    errdefer std.log.err("Problem with file {s}", .{name});
+    var dir = try std.Io.Dir.cwd().openDir(io, name, .{ .iterate = true, .follow_symlinks = true, .access_sub_paths = true });
     defer dir.close(io);
 
     var set: std.BufSet = .init(alloc);
@@ -251,7 +276,8 @@ pub fn getSubdirs(name: [:0]const u8, io: std.Io, alloc: std.mem.Allocator) !std
             const subdirName = try std.fs.path.resolve(alloc, &[_][]const u8{ name, entry.name });
             defer alloc.free(subdirName);
 
-            var subdir = try std.Io.Dir.cwd().openDir(io, subdirName, .{ .iterate = true });
+            errdefer std.log.err("Problem with file {s}", .{name});
+            var subdir = try std.Io.Dir.cwd().openDir(io, subdirName, .{ .iterate = true, .follow_symlinks = true, .access_sub_paths = true });
             defer subdir.close(io);
             var subiter = subdir.iterate();
 
